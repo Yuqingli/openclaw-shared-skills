@@ -316,6 +316,16 @@ Pushes to feature branch.
 #### Phase 7: USER GATE — inline (no sub-agent needed)
 Report results to user. Wait for confirmation before next step.
 **Implementation step always requires explicit user confirmation.**
+
+**For implementation steps, the gate message must include:**
+1. Summary of what was implemented
+2. Link to visual verification evidence (screenshots/recording)
+3. Specific smoke test steps for the user (derived from the spec's user journey), e.g.:
+   - "Start the app, navigate to Arena, click 'Find Match'"
+   - "Answer 3 questions, verify scores update"
+   - "Complete the match, confirm results screen shows"
+4. ⚠️ If no visual verification was performed (e.g., implementer couldn't run full stack), explicitly warn: **"Visual verification was not performed — manual testing is critical before proceeding."**
+
 **Update state:** `phase: "user_gate"`, `next_action: "Waiting for user to confirm <next_step>"`
 
 ### 3. State Tracking
