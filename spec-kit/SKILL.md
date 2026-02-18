@@ -26,8 +26,11 @@ The spec-kit pipeline involves long-running phases (authoring, reviewing, revisi
 
 ### What Gets Spawned (Sub-Agents)
 - **AUTHOR phase** → sub-agent runs Claude Code, writes artifact, updates state (~300s timeout)
-- **REVIEW phase** → sub-agent launches Codex + Gemini in parallel, saves reviews, updates state (~180s timeout)
 - **AUTO-REVISE phase** → sub-agent reads reviews, applies fixes, writes revision notes, updates state (~120s timeout)
+
+### What Runs as Direct Exec (NOT Sub-Agents)
+- **REVIEW phase** → Codex and Gemini CLIs launched directly via `exec background:true` from main session
+- ⚠️ **NEVER delegate review launching to sub-agents** — they are Claude instances that may write fake reviews instead of running the external tools
 
 ### Spawn Pattern
 ```
@@ -82,7 +85,7 @@ Config: <path to spec-kit-config.json>
 6. IMPLEMENT    → Execute tasks (one at a time)
 ```
 
-Each step follows the **Author → Review → Auto-Revise → Build/Test → Commit → Confirm** cycle.
+Each step follows the **Author → Review (with Flow Trace) → Auto-Revise → Build/Test → Visual Verification → Commit → Confirm** cycle.
 
 ## Trigger Patterns
 
@@ -157,40 +160,55 @@ For steps that produce artifacts (specify, plan, tasks, implement):
 
 **Update state (done by sub-agent):** `phase: "author"`, `next_action: "Launch Codex + Gemini reviews of <artifact>"`
 
-#### Phase 2: REVIEW (Codex + Gemini, parallel) — via sub-agent
-Only if review_mode is `full` or `lite`. **Do NOT run inline.**
+#### Phase 2: REVIEW (Codex + Gemini, parallel) — DIRECT EXEC, NOT sub-agents
+Only if review_mode is `full` or `lite`.
 
-1. Main session sends: "🔍 Spawning review agent for [step]..."
-2. `sessions_spawn` with task:
+⚠️ **CRITICAL:** Reviews MUST be performed by the actual external CLI tools (Codex, Gemini). **NEVER delegate review launching to sub-agents** — sub-agents are Claude instances that may write reviews themselves instead of running the external tools. This produces fake reviews that defeat the purpose of multi-model review.
+
+**Flow Trace (mandatory for implementation reviews):**
+The reviewer (Arc or whoever reviews) must include a "Flow Trace" section that traces the primary user journey through the code, click by click:
+- User action → event handler → API call → backend processing → state update → response → frontend re-render
+- Document each link in the chain. If any link is missing, unclear, or disconnected (e.g., no orchestration layer wiring components together) → flag as **Critical**.
+- If the reviewer cannot run the app, explicitly state: **"Needs manual verification — I reviewed code paths only"** instead of approving outright.
+
+Run reviews as direct `exec background:true` calls from the main session:
+
+1. Main session sends: "🔍 Launching Codex + Gemini reviews..."
+2. Launch BOTH reviewers in parallel using exec:
+
+   **Codex** (use `--full-auto` for unattended, `-c reasoning_effort="xhigh"` for deepest analysis):
    ```
-   Review the <step> artifact for <feature>.
-   Repo: <repo_path>
-   Artifact to review: <artifact_path>
-   Constitution: <constitution_path>
-   
-   Launch BOTH reviewers in parallel:
-   
-   Codex:
-     exec pty:true workdir:<repo_path> background:true command:"codex exec --full-auto 'Review the following artifact at <artifact_path>. Write your review to <review_path>. Focus on: completeness, correctness, edge cases, security concerns, and alignment with the constitution. Be specific — cite line numbers and suggest concrete fixes.'"
-   
-   Gemini:
-     exec pty:true workdir:<repo_path> background:true command:"gemini 'Review the following artifact at <artifact_path>. Write your review to <review_path>. Focus on: completeness, correctness, edge cases, security concerns, and alignment with the constitution. Be specific — cite line numbers and suggest concrete fixes.'"
-   
-   Wait for both to complete. Capture stdout and save review files manually
-   (Codex and Gemini run in read-only sandboxes and may not write files directly).
-   
-   When done, update memory/spec-kit-state.json:
-     phase: "review"
-     next_action: "Auto-revise <artifact> based on Codex/Gemini feedback"
-   Announce completion with review summary (critical/major/minor counts).
+   exec pty:true workdir:<repo> background:true timeout:900 command:"codex --model gpt-5.3-codex -c reasoning_effort=\"xhigh\" --full-auto 'Review the artifact at <path>. Read the project constitution at <constitution>. Write your review to <review_path>. Focus on: completeness, correctness, edge cases, security, and constitution alignment. Be specific — cite line numbers. Rate findings as Critical/High/Medium/Low.'"
    ```
-   Timeout: ~180s
-3. Sub-agent launches both reviewers in parallel, captures output, saves review files, updates state
-4. Main session reads state and proceeds to auto-revise
 
-**⚠️ Note:** Codex and Gemini run in read-only sandboxes — they may output reviews to stdout instead of writing files. The sub-agent must always capture their stdout and save review files manually.
+   **Gemini** (use `--yolo` to auto-approve all file writes and shell commands):
+   ```
+   exec pty:true workdir:<repo> background:true timeout:900 env:{"PATH":":/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"} command:"gemini --model gemini-3-pro-preview --yolo 'Review the artifact at <path>. Read the project constitution at <constitution>. Write your review to <review_path>. Focus on: completeness, correctness, edge cases, security, and constitution alignment. Be specific — cite line numbers. Rate findings as Critical/High/Medium/Low.'"
+   ```
 
-**Update state (done by sub-agent):** `phase: "review"`, `next_action: "Auto-revise <artifact> based on Codex/Gemini feedback"`
+3. Poll both sessions periodically (`process log`) to monitor progress
+4. When both complete, verify review files exist:
+   ```
+   exec command:"wc -l <review_paths>"
+   ```
+5. If a reviewer failed to write its file (e.g., wrote to stdout instead), capture the terminal log and save it manually. But **NEVER write a review yourself** pretending it came from another model.
+6. If a reviewer's model is unavailable or errors out, report the failure to the user and ask how to proceed (retry with different model, skip that reviewer, etc.)
+
+**Handling Gemini interactive prompts:** If Gemini gets stuck on approval prompts despite `--yolo`, use process send-keys to approve:
+```
+process action:send-keys sessionId:<id> keys:["Down", "Return"]
+```
+
+**Update state:** `phase: "review"`, `next_action: "Auto-revise <artifact> based on Codex/Gemini feedback"`
+
+### 🚫 Anti-Fake Review Rule
+
+Claude (in any form — main session, sub-agent, or spawned task) must **NEVER** write a review and attribute it to Codex or Gemini. If an external reviewer fails, the correct action is:
+1. Report the failure to the user
+2. Offer to retry with a different model or skip that reviewer
+3. If skipping, note in the revision that only one reviewer was used
+
+**Fabricating reviews destroys the value of multi-model review and is always wrong.**
 
 #### Phase 3: AUTO-REVISE (Claude — immediate, no user gate) — via sub-agent
 **This happens automatically after reviews complete.** Do NOT wait for user approval to revise. **Do NOT run inline.**
@@ -252,6 +270,39 @@ scripts/build-test.ps1 -RepoPath <path> -ConfigPath <config>
 ```
 If fail → Claude Code fixes → re-run (max 3 attempts).
 **Update state:** `phase: "build_test"`, `next_action: "Fix build failures"` or `next_action: "Commit code"`
+
+#### Phase 5.5: VISUAL VERIFICATION (mandatory for user-facing implementation steps)
+
+**This phase is non-negotiable.** It exists because passing tests alone proved insufficient — the Arena postmortem (2026-02) showed that 620+ tests could pass while the core feature was fundamentally non-functional.
+
+**Implementer must:**
+1. Run the full stack (not mocked, not headless)
+2. Manually walk through the core user journey as defined in the spec
+3. Capture evidence: screenshots or short screen recording of the feature working in a real browser
+4. Post evidence to the review channel/PR
+
+**Definition of Working checklist** (all must be YES before proceeding):
+- [ ] App starts cleanly on a fresh/clean database
+- [ ] Core user journey works end-to-end (as defined in spec)
+- [ ] No raw template strings, unrendered markup, or placeholder data visible in UI
+- [ ] User inputs handled realistically (numeric formats, units, typos, edge values)
+- [ ] Data flows through the full pipeline (not just individual components in isolation)
+- [ ] State transitions are driven by actual orchestration (not manually triggered or mocked)
+- [ ] Visual evidence captured and posted
+
+**If any checkbox fails → fix before proceeding. Do not commit incomplete work.**
+
+**If the implementer cannot run the full stack** (e.g., no Docker), they must explicitly flag this and request manual verification from someone who can. This is NOT a skip — it's a delegation.
+
+**Update state:** `phase: "visual_verify"`, `next_action: "Post visual evidence and proceed to commit"`
+
+**E2E Test Quality Gate:**
+Before visual verification, confirm that E2E tests meet these standards:
+- Every E2E test starts with a user story: "As a [role], I [action], and I see [outcome]"
+- Tests run against the full stack through the actual UI (not direct API calls)
+- Assertions check **visible outcomes** (rendered text, UI state), not just API responses or DOM existence
+- At least one test uses realistic user input (e.g., "3.50" not just "3.5", "$5" not just "5")
+- **Anti-pattern to reject:** Tests that hit API endpoints directly and assert on JSON responses are integration tests, not E2E. Label them correctly — they cannot substitute for real E2E validation.
 
 #### Phase 6: AUTO-COMMIT — inline (no sub-agent needed)
 Quick operation, runs directly in the main session.
@@ -356,6 +407,31 @@ When orchestrating the pipeline, keep the user informed:
 8. **Use PTY mode** for all coding agent processes.
 9. **Don't run agents in the clawd workspace.** Always use the target repo's directory.
 10. **Resume on startup.** Always check `spec-kit-state.json` when starting a session. If there's active work, resume it (or remind user if at a gate).
-11. **Always use `sessions_spawn` for heavy phases.** Author, review, and revise phases involve multiple tool calls and long-running processes — they MUST be offloaded to sub-agents. Never run these inline in the main chat session.
-12. **Keep inline only lightweight operations.** State reads, progress messages, user gates, quick commits, and orchestration decisions stay in the main session. Everything else goes to a sub-agent.
-13. **Sub-agent timeouts.** Use ~300s for authoring, ~180s for reviews, ~120s for revisions. If a sub-agent times out, update state with a note and retry or ask the user.
+11. **Use `sessions_spawn` for AUTHOR and REVISE phases only.** These involve Claude doing heavy file I/O and are safe to delegate to sub-agents.
+12. **REVIEW phase runs as direct exec from main session.** NEVER delegate review launching to sub-agents. Sub-agents are Claude instances that may write reviews themselves instead of running external tools. Launch Codex and Gemini CLIs directly via `exec background:true` and poll their progress.
+13. **NEVER fake a review.** Claude must never write a review and attribute it to Codex, Gemini, or any other model. If an external reviewer fails, report the failure and ask the user how to proceed. Fabricating reviews is always wrong.
+14. **Keep inline only lightweight operations.** State reads, progress messages, user gates, quick commits, and orchestration decisions stay in the main session.
+15. **Timeouts.** Use ~300s for authoring sub-agents, ~120s for revision sub-agents, and **~1800s for review exec sessions** (Codex/Gemini xhigh can take 10-15+ minutes on complex artifacts). If a process times out, retry with a longer timeout or ask the user. Previous 900s timeout was insufficient — reviews consistently took 12-18 minutes.
+16. **Visual verification before commit.** Any implementation step that produces user-facing changes MUST include visual proof (screenshots/recording) of the feature working in a real browser on a clean database. Passing tests alone is insufficient — this was learned the hard way (Arena postmortem, 2026-02). The implementer provides evidence; the reviewer confirms it matches the spec.
+17. **Pre-merge smoke test prompt.** The user gate message for implementation steps must include specific steps for a 2-minute manual smoke test (derived from the spec's user journey), link to visual verification evidence, and explicitly ask the user to confirm they've tested it before proceeding.
+
+## Windows-Specific Notes
+
+### Codex CLI on Windows
+- **Model**: Use `gpt-5.3-codex` (requires codex-cli ≥0.101.0). Run `npm update -g @openai/codex` if model not found.
+- **Sandbox prompt**: First run shows "Set Up Agent Sandbox" interactive prompt that blocks `--full-auto`. Select option 2 "Stay in Read-Only" via `send-keys: ["Down", "Return"]`. Persists after first acceptance.
+- **Read-Only mode**: Codex in read-only will ask "Would you like to run the following command?" before writing files. Approve via `send-keys: ["Return"]`.
+- **Bypass all prompts**: Use `codex --dangerously-bypass-approvals-and-sandbox -c reasoning_effort="xhigh" "prompt"` to skip sandbox + approval prompts entirely. Only safe in contained VMs. This is the **preferred mode for review runs** on Arc's VM.
+- **Auth**: Works with ChatGPT Plus subscription (chatgpt auth mode). No `OPENAI_API_KEY` needed.
+- **PowerShell**: Use `;` not `&&` to chain commands.
+
+### Gemini CLI on Windows
+- **Trust prompt**: First run in a new directory shows "Do you trust this folder?" prompt. Select option 1 via `send-keys: ["Return"]`. After accepting, Gemini restarts and loses the original command — must re-send the prompt.
+- **`--yolo` flag**: Works correctly after folder trust is established.
+- **Auth**: Google OAuth via `gemini auth login`.
+
+### General Windows Tips
+- **Run Codex and Gemini sequentially** (one at a time) on Windows VMs. Parallel runs hit the exec timeout faster and both get killed. Running sequentially is more reliable.
+- **SIGKILL is usually timeout, NOT OOM.** Check `process list` — if both sessions show the same runtime (e.g., 15m1s), it's the exec timeout. Bump timeout to 1800s for complex reviews. Always verify system memory (`systeminfo`) before assuming OOM.
+- Sub-agents spawned via `sessions_spawn` may fail to write files on Windows. For authoring/revision, prefer inline execution in main session if sub-agents fail twice.
+- Delete `~/.codex/models_cache.json` after updating codex-cli to refresh available models.
